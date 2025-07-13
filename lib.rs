@@ -15,11 +15,24 @@ extern crate proc_macro2;
 extern crate syn;
 #[macro_use]
 extern crate synstructure;
+#[macro_use]
+extern crate darling;
 
 #[cfg(not(test))]
-decl_derive!([MallocSizeOf, attributes(ignore_malloc_size_of, conditional_malloc_size_of)] => malloc_size_of_derive);
+decl_derive!([MallocSizeOf, attributes(ignore_malloc_size_of, conditional_malloc_size_of, malloc_size_of)] => malloc_size_of_derive);
+
+#[derive(Default, FromDeriveInput)]
+#[darling(attributes(malloc_size_of))]
+struct ContainerAttr {
+    #[darling(default)]
+    no_bound: darling::util::PathList
+}
 
 fn malloc_size_of_derive(s: synstructure::Structure) -> proc_macro2::TokenStream {
+    use darling::FromDeriveInput;
+
+    let container_attr = ContainerAttr::from_derive_input(s.ast())
+        .unwrap_or_default();
     let match_body = s.each(|binding| {
         let mut ignore = false;
         let mut conditional = false;
@@ -80,6 +93,9 @@ fn malloc_size_of_derive(s: synstructure::Structure) -> proc_macro2::TokenStream
     let mut where_clause = where_clause.unwrap_or(&parse_quote!(where)).clone();
     for param in ast.generics.type_params() {
         let ident = &param.ident;
+        if container_attr.no_bound.iter().any(|path| path.is_ident(ident)) {
+            continue;
+        }
         where_clause
             .predicates
             .push(parse_quote!(#ident: ::malloc_size_of::MallocSizeOf));
@@ -140,4 +156,31 @@ fn test_struct() {
 fn test_no_reason() {
     let input = syn::parse_str("struct A { #[ignore_malloc_size_of] b: C }").unwrap();
     malloc_size_of_derive(synstructure::Structure::new(&input));
+}
+
+#[test]
+fn test_no_bound() {
+    let source = syn::parse_str(
+        "#[malloc_size_of(no_bound(T))] struct Foo<T, U> { bar: U, #[ignore_malloc_size_of = \"\"] z: Arc<T> }"
+    ).unwrap();
+    let source = synstructure::Structure::new(&source);
+    let expanded = malloc_size_of_derive(source).to_string();
+    let no_space = expanded.replace(" ", "");
+    macro_rules! match_count {
+        ($e: expr, $count: expr) => {
+            assert_eq!(
+                no_space.matches(&$e.replace(" ", "")).count(),
+                $count,
+                "counting occurences of {:?} in {:?} (whitespace-insensitive)",
+                $e,
+                expanded
+            )
+        };
+    }
+    match_count!("struct", 0);
+    match_count!("ignore_malloc_size_of", 0);
+    match_count!("impl<T, U> ::malloc_size_of::MallocSizeOf for Foo<T, U>", 1);
+    match_count!("T: ::malloc_size_of::MallocSizeOf", 0);
+    match_count!("U: ::malloc_size_of::MallocSizeOf", 1);
+    match_count!("sum += ::malloc_size_of::MallocSizeOf::size_of(", 1);
 }
